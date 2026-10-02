@@ -13,6 +13,9 @@ COPY_SEGMENT_SIZE = int(os.environ.get("ORIGIN_COPY_SEGMENT_SIZE", "16"))
 COPY_MAX_SEGMENT_SIZE = int(os.environ.get("ORIGIN_COPY_MAX_SEGMENT_SIZE", "1024"))
 # Upper bound for object paths accepted by one revision-GC request.
 GC_MAX_PATHS = int(os.environ.get("ORIGIN_GC_MAX_PATHS", "100"))
+# Allowed lifetime window of a revision lease, in seconds.
+LEASE_MIN_TTL = int(os.environ.get("ORIGIN_LEASE_MIN_TTL", "60"))
+LEASE_MAX_TTL = int(os.environ.get("ORIGIN_LEASE_MAX_TTL", "86400"))
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS objects (
@@ -135,6 +138,39 @@ CREATE TABLE IF NOT EXISTS copy_session_acks (
                            DEFAULT date_trunc('second', now()),
     PRIMARY KEY (session_id, segment_no)
 );
+
+-- Revision leases.  A lease pins ONE still-stored revision of an object
+-- path for a bounded lifetime: GC may not collect a revision while an
+-- active lease references it, and GET/HEAD on the lease serves that
+-- exact old revision even after the path has moved on (or away).  The
+-- lease is identified by a random, unguessable id; releasing it marks
+-- released_at, and expires_at is computed server-side at creation.
+--
+-- revision_id is ON DELETE SET NULL deliberately: once a revision is
+-- truly unreferenced -- every lease on it expired or released -- GC
+-- deletes the revision row, and historical lease rows are detached
+-- rather than cascaded away, so a later read of an expired/consumed
+-- lease is answerable as 410 ("the lease existed, its content is gone")
+-- instead of being indistinguishable from a never-issued id (404).
+CREATE TABLE IF NOT EXISTS revision_leases (
+    id          text PRIMARY KEY,
+    object_path text NOT NULL REFERENCES objects (path),
+    revision_id bigint REFERENCES revisions (id) ON DELETE SET NULL,
+    revision_no bigint NOT NULL,
+    ttl_seconds integer NOT NULL,
+    expires_at  timestamptz NOT NULL,
+    released_at timestamptz,
+    created_at  timestamptz NOT NULL
+                            DEFAULT date_trunc('second', now())
+);
+
+-- GC classification runs "does an active lease pin this revision?" for
+-- every candidate revision, so the revision column is indexed.  (The
+-- active predicate involves now(), which is STABLE and therefore not
+-- allowed in a partial-index predicate; the index covers released and
+-- detached historical rows as well, and the EXISTS check filters them.)
+CREATE INDEX IF NOT EXISTS revision_leases_revision_idx
+    ON revision_leases (revision_id);
 
 -- Backfill the per-path revision high-water mark on databases created
 -- before path moves (runs here, once the ``revisions`` table exists).

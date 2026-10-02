@@ -30,11 +30,25 @@ new target revision and detaches the source (its GET/HEAD become 404).
 A per-path revision high-water mark keeps numbers monotonic when a
 moved-away path is later re-PUT or reused as a target, even after /gc
 has removed every leftover revision.
+
+Revision leases (``POST /revision-leases``) pin one still-stored revision
+for 60..86400 seconds.  Creation locks the object row FOR UPDATE before
+reading the revision and inserting the lease, so it is impossible to
+report a lease created for a revision that GC removes in the same
+instant; GC preview and execute report ``revision_lease`` as a retention
+reason and never delete a pinned revision.  GET/HEAD on
+``/revision-leases/{id}/content`` serve the bound revision (by immutable
+revision id) through the same conditional/Range machinery, so path
+moves and re-PUTs never change the response, and the share lock held for
+the whole stream keeps bytes and metadata intact even if the lease
+expires or is released mid-read.  DELETE releases idempotently; unknown
+ids are 404 and reads of expired/released/consumed leases are 410.
 """
 from __future__ import annotations
 
 import base64
 import os
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -50,6 +64,8 @@ from .config import (
     COPY_SEGMENT_SIZE,
     DATABASE_URL,
     GC_MAX_PATHS,
+    LEASE_MAX_TTL,
+    LEASE_MIN_TTL,
 )
 from .copy_sessions import (
     CopyCursor,
@@ -98,6 +114,62 @@ def validator_headers(rev) -> dict[str, str]:
         "ETag": str(make_etag(rev.sha256)),
         "Last-Modified": http_date(rev.created_at),
     }
+
+
+def _stream_revision_response(pool, conn, tx, rev, plan: Plan) -> StreamingResponse:
+    """Stream ``plan`` for the already-selected, locked revision ``rev``.
+
+    The transaction (and its object-row lock) is committed only after the
+    last byte has been yielded and rolled back on any error; the pooled
+    connection is released in ``finally``.  Shared by the ordinary
+    GET /objects path and GET /revision-leases/{id}/content so an old
+    revision bound to a lease streams under exactly the same guarantees.
+    """
+    if plan.kind == "full":
+        async def body() -> AsyncIterator[bytes]:
+            async for chunk in database.stream_revision(
+                conn, rev.id, 0, rev.length - 1
+            ):
+                yield chunk
+    elif plan.kind == "single":
+        rng = plan.ranges[0]
+
+        async def body() -> AsyncIterator[bytes]:
+            async for chunk in database.stream_revision(
+                conn, rev.id, rng.first, rng.last
+            ):
+                yield chunk
+    else:
+        ranges = plan.ranges
+        boundary = plan.boundary
+
+        async def body() -> AsyncIterator[bytes]:
+            for rng in ranges:
+                part = MultipartPart(
+                    rng.first, rng.last, rev.length, rev.media_type
+                )
+                yield part.header_block(boundary)
+                async for chunk in database.stream_revision(
+                    conn, rev.id, rng.first, rng.last
+                ):
+                    yield chunk
+                yield b"\r\n"
+            yield closing_delimiter(boundary)
+
+    async def wrapped() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in body():
+                yield chunk
+            await tx.commit()
+        except Exception:
+            await tx.rollback()
+            raise
+        finally:
+            await pool.release(conn)
+
+    return StreamingResponse(
+        wrapped(), status_code=plan.status, headers=plan.headers
+    )
 
 
 def build_plan(rev, request: Request) -> Plan:
@@ -241,74 +313,8 @@ async def read_object(path: str, request: Request):
             await tx.commit()
             return Response(status_code=plan.status, headers=plan.headers)
 
-        if plan.kind == "full":
-            async def full_body() -> AsyncIterator[bytes]:
-                try:
-                    async for chunk in database.stream_revision(
-                        conn, rev.id, 0, rev.length - 1
-                    ):
-                        yield chunk
-                    await tx.commit()
-                except Exception:
-                    await tx.rollback()
-                    raise
-                finally:
-                    await pool.release(conn)
-
-            streaming = True
-            return StreamingResponse(
-                full_body(), status_code=plan.status, headers=plan.headers
-            )
-
-        if plan.kind == "single":
-            rng = plan.ranges[0]
-
-            async def single_body() -> AsyncIterator[bytes]:
-                try:
-                    async for chunk in database.stream_revision(
-                        conn, rev.id, rng.first, rng.last
-                    ):
-                        yield chunk
-                    await tx.commit()
-                except Exception:
-                    await tx.rollback()
-                    raise
-                finally:
-                    await pool.release(conn)
-
-            streaming = True
-            return StreamingResponse(
-                single_body(), status_code=206, headers=plan.headers
-            )
-
-        # multipart/byteranges
-        ranges = plan.ranges
-        boundary = plan.boundary
-
-        async def multipart_body() -> AsyncIterator[bytes]:
-            try:
-                for rng in ranges:
-                    part = MultipartPart(
-                        rng.first, rng.last, rev.length, rev.media_type
-                    )
-                    yield part.header_block(boundary)
-                    async for chunk in database.stream_revision(
-                        conn, rev.id, rng.first, rng.last
-                    ):
-                        yield chunk
-                    yield b"\r\n"
-                yield closing_delimiter(boundary)
-                await tx.commit()
-            except Exception:
-                await tx.rollback()
-                raise
-            finally:
-                await pool.release(conn)
-
         streaming = True
-        return StreamingResponse(
-            multipart_body(), status_code=206, headers=plan.headers
-        )
+        return _stream_revision_response(pool, conn, tx, rev, plan)
     finally:
         if not streaming:
             await pool.release(conn)
@@ -1008,6 +1014,19 @@ def _gc_not_found(missing: list[str]) -> JSONResponse:
     )
 
 
+def _gc_retained_entry(rev) -> dict:
+    reasons = []
+    if rev.is_current:
+        reasons.append("current")
+    if rev.in_manifest:
+        reasons.append("copy_manifest")
+    if rev.in_baseline:
+        reasons.append("target_baseline")
+    if rev.in_lease:
+        reasons.append("revision_lease")
+    return {"revision_no": rev.revision_no, "reasons": reasons}
+
+
 def _gc_preview(paths: list[str], before: datetime, classified) -> dict:
     """Dry-run report: per path, the candidate revisions (with their
     bytes), the releasable total, and the retained revisions with the
@@ -1018,16 +1037,7 @@ def _gc_preview(paths: list[str], before: datetime, classified) -> dict:
     for rev in classified:
         bucket = per_path[rev.path]
         if rev.retained:
-            reasons = []
-            if rev.is_current:
-                reasons.append("current")
-            if rev.in_manifest:
-                reasons.append("copy_manifest")
-            if rev.in_baseline:
-                reasons.append("target_baseline")
-            bucket["retained"].append(
-                {"revision_no": rev.revision_no, "reasons": reasons}
-            )
+            bucket["retained"].append(_gc_retained_entry(rev))
         else:
             bucket["candidates"].append(
                 {"revision_no": rev.revision_no, "bytes": rev.length}
@@ -1061,8 +1071,9 @@ async def gc_revisions(request: Request):
     Only revisions created strictly before ``before`` are considered at
     all, and a revision is deleted only when nothing can still reach it:
     the current revision of every object, every revision pinned by a
-    copy-session manifest and every revision referenced by a target
-    baseline are always retained.  ``dry_run`` (default true) reports
+    copy-session manifest, every revision referenced by a target
+    baseline and every revision pinned by an active revision lease are
+    always retained.  ``dry_run`` (default true) reports candidates,
     candidates, releasable bytes and retention reasons from one
     repeatable-read snapshot without changing anything.  With
     ``dry_run=false`` the object rows are locked in ascending path order
@@ -1157,10 +1168,230 @@ async def gc_revisions(request: Request):
                 }
                 for r in victims
             ]
+            # The execute path reports the same retention reasons the
+            # preview does (including revision_lease), per path order.
+            retained = {}
+            for r in classified:
+                if r.retained:
+                    retained.setdefault(r.path, []).append(_gc_retained_entry(r))
+            retained = [
+                {"path": p, "retained": retained.get(p, [])} for p in paths
+            ]
     return {
         "dry_run": False,
         "before": before.isoformat(),
         "deleted": deleted,
         "deleted_count": len(deleted),
         "deleted_bytes": sum(d["bytes"] for d in deleted),
+        "retained": retained,
     }
+
+
+# ---- revision leases ----------------------------------------------------------
+
+
+def _lease_gone(lease, state: str) -> JSONResponse:
+    """410 for an expired/released/consumed lease (the id WAS issued)."""
+    return JSONResponse(
+        {
+            "detail": "lease_not_active",
+            "lease": lease.id,
+            "state": state,
+            "expires_at": lease.expires_at.isoformat(),
+            "released_at": (
+                lease.released_at.isoformat() if lease.released_at else None
+            ),
+        },
+        status_code=410,
+    )
+
+
+@app.post("/revision-leases", status_code=201)
+async def create_revision_lease(request: Request):
+    """Pin one still-stored revision for a bounded lifetime.
+
+    The request gives ``path``, a positive ``revision_no`` and a TTL of
+    60..86400 seconds.  Creation takes the object row FOR UPDATE lock --
+    the very lock publishers and the GC execute path take -- and only
+    then looks the revision up and inserts the lease in the same
+    transaction, so the lease can never be reported created for a
+    revision that was concurrently collected (GC blocks on the row lock
+    until commit, then sees the lease and retains the revision).  A
+    revision already gone -- or a path with no such revision number -- is
+    404; malformed parameters are 400.  The response carries a random
+    unguessable lease id, the server-computed expiry instant and the
+    bound revision's strong ETag.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _bad_request("request body must be a JSON object")
+
+    path = body.get("path")
+    if not isinstance(path, str) or not path:
+        return _bad_request("path must be a non-empty string")
+
+    revision_no = body.get("revision_no")
+    if (
+        not isinstance(revision_no, int)
+        or isinstance(revision_no, bool)
+        or revision_no < 1
+    ):
+        return _bad_request("revision_no must be a positive integer")
+
+    ttl = body.get("ttl_seconds")
+    if (
+        not isinstance(ttl, int)
+        or isinstance(ttl, bool)
+        or not LEASE_MIN_TTL <= ttl <= LEASE_MAX_TTL
+    ):
+        return _bad_request(
+            f"ttl_seconds must be an integer in "
+            f"[{LEASE_MIN_TTL}, {LEASE_MAX_TTL}]"
+        )
+
+    pool = request.app.state.pool
+    conn = await pool.acquire()
+    tx = conn.transaction()
+    await tx.start()
+    try:
+        try:
+            # Lock the object row BEFORE reading the revision: the same
+            # FOR UPDATE lock publishers and GC take, so a concurrent
+            # collection cannot delete the revision between our lookup
+            # and the lease insert ("lease succeeded but revision lost").
+            await database.lock_object_for_lease(conn, path)
+            rev = await database.find_revision(conn, path, revision_no)
+            if rev is None:
+                await tx.rollback()
+                return JSONResponse(
+                    {
+                        "detail": "revision_not_found",
+                        "path": path,
+                        "revision_no": revision_no,
+                    },
+                    status_code=404,
+                )
+            lease_id = secrets.token_hex(16)
+            expires_at = await database.insert_lease(
+                conn, lease_id, path, rev, ttl
+            )
+            await tx.commit()
+        except Exception:
+            await tx.rollback()
+            raise
+    finally:
+        await pool.release(conn)
+
+    return JSONResponse(
+        {
+            "lease": lease_id,
+            "path": path,
+            "revision_no": rev.revision_no,
+            "etag": str(make_etag(rev.sha256)),
+            "ttl_seconds": ttl,
+            "expires_at": expires_at.isoformat(),
+        },
+        status_code=201,
+        headers={
+            "Location": f"/revision-leases/{lease_id}/content",
+            "ETag": str(make_etag(rev.sha256)),
+            "Last-Modified": http_date(rev.created_at),
+        },
+    )
+
+
+@app.api_route(
+    "/revision-leases/{lease_id}/content", methods=["GET", "HEAD"]
+)
+async def read_lease_content(lease_id: str, request: Request):
+    """Serve the revision the lease bound at creation -- never anything newer.
+
+    The lease row is read first: an unknown id is 404; an expired,
+    released or consumed lease is 410.  Only then is the object row
+    share-locked (the same lock a streaming GET /objects holds) and the
+    bound revision id loaded, after which the ordinary RFC 9110
+    precondition chain and Range/If-Range rules run unchanged.  Because
+    the binding is the immutable revision *id*, a path migration or a
+    re-PUT cannot alter the response; because the share lock is held
+    until the last byte, an expiry/release that becomes due while bytes
+    are flowing -- or a DELETE arriving mid-stream -- neither truncates
+    the body nor changes the already-sent metadata, and GC simply waits
+    for the lock before it can collect anything.
+    """
+    pool = request.app.state.pool
+    conn = await pool.acquire()
+    tx = conn.transaction()
+    await tx.start()
+    streaming = False
+    try:
+        lease = await database.get_lease(conn, lease_id)
+        if lease is None:
+            await tx.rollback()
+            return JSONResponse({"detail": "lease_not_found"}, status_code=404)
+        state = lease.state_at(datetime.now(timezone.utc))
+        if state != "active" or lease.revision_id is None:
+            await tx.rollback()
+            return _lease_gone(lease, state if lease.revision_id is not None
+                               else "consumed")
+
+        # From here on the lease is active; share-lock the object (blocking
+        # GC and publishers for the life of the stream) and load the bound
+        # revision by its immutable id.
+        await database.lock_object_for_read(conn, lease.object_path)
+        rev = await database.get_revision_by_id(conn, lease.revision_id)
+        if rev is None:
+            # Cannot happen for an active lease: the active classification
+            # and GC both run against the same row lock, but if the row was
+            # ever missing, the content is definitively gone -- 410.
+            await tx.rollback()
+            return _lease_gone(lease, "consumed")
+
+        conditions = _conditions_from_request(request.method, request)
+        outcome = evaluate(conditions, _selected(rev))
+        if outcome is Outcome.PRECONDITION_FAILED:
+            await tx.rollback()
+            return JSONResponse(
+                {"detail": "Precondition Failed"},
+                status_code=412,
+                headers=validator_headers(rev),
+            )
+        if outcome is Outcome.NOT_MODIFIED:
+            await tx.commit()
+            return Response(status_code=304, headers=validator_headers(rev))
+
+        plan = build_plan(rev, request)
+        if plan.status == 416:
+            await tx.rollback()
+            return Response(status_code=416, headers=plan.headers)
+
+        if request.method == "HEAD":
+            await tx.commit()
+            return Response(status_code=plan.status, headers=plan.headers)
+
+        streaming = True
+        return _stream_revision_response(pool, conn, tx, rev, plan)
+    finally:
+        if not streaming:
+            await pool.release(conn)
+
+
+@app.delete("/revision-leases/{lease_id}")
+async def release_revision_lease(lease_id: str, request: Request):
+    """Idempotently release a lease.
+
+    Releasing an active lease succeeds with 204; repeating the DELETE --
+    or deleting an already expired lease -- also returns 204 (the state
+    converges to "released").  Only an id that was never issued is 404.
+    Releasing touches only the lease row, so it never blocks a read
+    currently streaming the pinned revision.
+    """
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        lease = await database.get_lease(conn, lease_id)
+        if lease is None:
+            return JSONResponse({"detail": "lease_not_found"}, status_code=404)
+        await database.release_lease(conn, lease_id)
+    return Response(status_code=204)
