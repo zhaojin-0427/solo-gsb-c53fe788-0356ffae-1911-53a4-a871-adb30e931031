@@ -48,6 +48,22 @@ get 404), all in one transaction that locks both endpoints in ascending
 path order.  The per-path ``revision_seq`` high-water mark keeps
 revision numbers monotonic after a move-away even when /gc later removes
 every leftover revision row.
+
+Revision leases (``POST /revision-leases``) are a fourth GC retention
+reason on equal footing with the current revision, manifests and
+baselines.  Lease creation takes the owning object row FOR UPDATE
+*before* looking up the pinned revision, serialising it against GC
+execute in the same global lock order: a committed lease is visible to
+GC's locked classification (an active lease is one whose
+``released_at IS NULL AND expires_at > now()``), and a revision GC
+already deleted cannot be leased (404).  The lease table deliberately
+has no foreign key to ``revisions`` -- after expiry or release, GC may
+collect the bound revision while the lease row stays (so reads answer
+410 rather than 404) -- instead a content read first reads the lease,
+then share-locks its object row and only then re-checks lease liveness
+and revision existence; the transaction and share lock are held until
+the last streamed byte, so expiry/release during a read never tears the
+response, and a DELETE-based release is idempotent.
 """
 from __future__ import annotations
 
@@ -929,9 +945,10 @@ async def apply_copy_entries(
 class GcRevision:
     """A revision older than the GC cutoff, with its retention facts.
 
-    ``retained`` is the disjunction of the three reasons a revision may
+    ``retained`` is the disjunction of the four reasons a revision may
     not be collected: it is the object's current revision, a copy-session
-    manifest pins it, or a target baseline references it.
+    manifest pins it, a target baseline references it, or an active
+    revision lease holds it.
     """
 
     id: int
@@ -942,10 +959,16 @@ class GcRevision:
     is_current: bool
     in_manifest: bool
     in_baseline: bool
+    in_lease: bool
 
     @property
     def retained(self) -> bool:
-        return self.is_current or self.in_manifest or self.in_baseline
+        return (
+            self.is_current
+            or self.in_manifest
+            or self.in_baseline
+            or self.in_lease
+        )
 
 
 async def lock_existing_objects(
@@ -1012,7 +1035,7 @@ async def classify_revisions(
 ) -> list[GcRevision]:
     """Revisions of ``paths`` created strictly before ``before``.
 
-    Every row carries its three retention facts, evaluated in the
+    Every row carries its retention facts, evaluated in the
     caller's transaction (for the execute path: under the held FOR
     UPDATE locks, so the facts cannot go stale before the DELETE).
     Ordered by ascending path and revision number -- the fixed order the
@@ -1026,7 +1049,11 @@ async def classify_revisions(
                EXISTS (SELECT 1 FROM copy_session_entries e
                         WHERE e.revision_id = r.id) AS in_manifest,
                EXISTS (SELECT 1 FROM copy_session_target_baselines b
-                        WHERE b.revision_id = r.id) AS in_baseline
+                        WHERE b.revision_id = r.id) AS in_baseline,
+               EXISTS (SELECT 1 FROM revision_leases l
+                        WHERE l.revision_id = r.id
+                          AND l.released_at IS NULL
+                          AND l.expires_at > now()) AS in_lease
           FROM revisions r
           JOIN objects o ON o.path = r.object_path
          WHERE r.object_path = ANY($1::text[])
@@ -1046,6 +1073,7 @@ async def classify_revisions(
             is_current=row["is_current"],
             in_manifest=row["in_manifest"],
             in_baseline=row["in_baseline"],
+            in_lease=row["in_lease"],
         )
         for row in rows
     ]
@@ -1071,3 +1099,203 @@ async def delete_revisions(
         "DELETE FROM revisions WHERE id = ANY($1::bigint[])",
         revision_ids,
     )
+
+
+# ---- historical revision leases -----------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RevisionLease:
+    """One revision lease as stored (``revision_id`` may outlive the
+    revision row -- see the table comment in config.SCHEMA_SQL)."""
+
+    id: str
+    object_path: str
+    revision_id: int
+    revision_no: int
+    created_at: datetime
+    expires_at: datetime
+    released_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class LeasedRevision:
+    """Outcome of pinning a lease's revision for a content read:
+
+    ``"missing"``  -- no lease row exists for the id (HTTP 404);
+    ``"released"`` -- released lease (HTTP 410);
+    ``"expired"``  -- never released but past ``expires_at`` (HTTP 410);
+    ``"active"``   -- valid lease, ``revision`` is locked FOR SHARE and
+                      the caller's transaction owns that lock until the
+                      full body has been streamed.
+    """
+
+    status: str
+    lease: RevisionLease | None = None
+    revision: CurrentRevision | None = None
+
+
+def _to_lease(row: asyncpg.Record) -> RevisionLease:
+    return RevisionLease(
+        id=row["id"],
+        object_path=row["object_path"],
+        revision_id=row["revision_id"],
+        revision_no=row["revision_no"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        released_at=row["released_at"],
+    )
+
+
+async def lock_path_revision_for_lease(
+    conn: asyncpg.Connection, path: str, revision_no: int
+) -> CurrentRevision | None:
+    """Lock the object row FOR UPDATE and fetch one of its revisions.
+
+    Lease creation and GC execute both take the object row lock before
+    touching ``revisions`` (the same global order every writer uses), so
+    they are strictly serialised per object: a lease whose revision
+    lookup succeeds is committed before GC's re-classification can see
+    the revision, and a revision GC has just deleted cannot be leased.
+    Returns None when the path has no object row (no placeholder is ever
+    created by leasing) or the revision number is not stored.
+    """
+    await conn.execute(
+        """
+        SELECT o.path
+          FROM objects o
+         WHERE o.path = $1
+         FOR UPDATE OF o
+        """,
+        path,
+    )
+    row = await conn.fetchrow(
+        """
+        SELECT r.id, r.revision_no, r.sha256, r.media_type,
+               octet_length(r.content) AS length, r.created_at
+          FROM revisions r
+         WHERE r.object_path = $1 AND r.revision_no = $2
+        """,
+        path,
+        revision_no,
+    )
+    return None if row is None else _to_revision(row)
+
+
+async def insert_revision_lease(
+    conn: asyncpg.Connection,
+    lease_id: str,
+    path: str,
+    rev: CurrentRevision,
+    ttl_seconds: int,
+) -> RevisionLease:
+    """Persist a lease expiring ``ttl_seconds`` after the database clock.
+
+    ``expires_at`` is computed by PostgreSQL (``now() + interval``) so
+    that GC's ``expires_at > now()`` liveness test uses one clock.
+    """
+    row = await conn.fetchrow(
+        """
+        INSERT INTO revision_leases
+            (id, object_path, revision_id, revision_no, expires_at)
+        VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
+        RETURNING id, object_path, revision_id, revision_no,
+                  created_at, expires_at, released_at
+        """,
+        lease_id,
+        path,
+        rev.id,
+        rev.revision_no,
+        ttl_seconds,
+    )
+    return _to_lease(row)
+
+
+async def pin_leased_revision(conn: asyncpg.Connection, lease_id: str) -> LeasedRevision:
+    """Resolve a lease and lock its revision's object row FOR SHARE.
+
+    Two statements are required: only the lease row knows which object
+    row to lock.  The lease is read first (no lock -- releases do not
+    block reads), the object row is share-locked, and only then are the
+    lease status and revision existence re-checked.  Under the held
+    share lock GC (FOR UPDATE) cannot delete the revision, and a path
+    move / PUT cannot move the current pointer: the response is bound to
+    the leased revision until the caller commits after the last byte,
+    even if the lease expires or is released while bytes are in flight.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, object_path, revision_id, revision_no,
+               created_at, expires_at, released_at
+          FROM revision_leases
+         WHERE id = $1
+        """,
+        lease_id,
+    )
+    if row is None:
+        return LeasedRevision(status="missing")
+    lease = _to_lease(row)
+
+    await conn.execute(
+        "SELECT path FROM objects WHERE path = $1 FOR SHARE",
+        lease.object_path,
+    )
+
+    # Re-check under the held object lock: a GC that committed before
+    # the lock was taken may have collected the revision (an expired /
+    # released lease no longer retains it).  now() is the transaction
+    # time, which also governs the GC liveness test.
+    fresh = await conn.fetchrow(
+        """
+        SELECT released_at, (expires_at <= now()) AS expired
+          FROM revision_leases
+         WHERE id = $1
+        """,
+        lease_id,
+    )
+    if fresh["released_at"] is not None or fresh["expired"]:
+        status = "released" if fresh["released_at"] is not None else "expired"
+        return LeasedRevision(status=status, lease=lease)
+
+    rev_row = await conn.fetchrow(
+        """
+        SELECT r.id, r.revision_no, r.sha256, r.media_type,
+               octet_length(r.content) AS length, r.created_at
+          FROM revisions r
+         WHERE r.id = $1
+        """,
+        lease.revision_id,
+    )
+    if rev_row is None:
+        # The revision was collected before this read acquired the lock;
+        # the lease must already be inactive (active leases retain it).
+        return LeasedRevision(status="expired", lease=lease)
+    return LeasedRevision(
+        status="active", lease=lease, revision=_to_revision(rev_row)
+    )
+
+
+async def release_revision_lease(conn: asyncpg.Connection, lease_id: str) -> str:
+    """Idempotently release a lease.
+
+    ``"missing"`` -- no lease with this id ever existed (HTTP 404);
+    ``"released_now"`` -- this call marked it released (HTTP 204);
+    ``"already_released"`` -- a prior DELETE did, or it has since
+    expired (also HTTP 204: release of a known lease id is idempotent).
+    """
+    row = await conn.fetchrow(
+        "SELECT released_at, now() >= expires_at AS expired"
+        "  FROM revision_leases WHERE id = $1",
+        lease_id,
+    )
+    if row is None:
+        return "missing"
+    if row["released_at"] is not None or row["expired"]:
+        return "already_released"
+    updated = await conn.fetchval(
+        "UPDATE revision_leases SET released_at = now()"
+        " WHERE id = $1 AND released_at IS NULL AND expires_at > now()"
+        " RETURNING id",
+        lease_id,
+    )
+    return "released_now" if updated is not None else "already_released"

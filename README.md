@@ -13,7 +13,8 @@
 - `If-Range`（ETag 强比较或 HTTP 日期）失配时忽略 Range，返回完整实体（200）。
 - 每次响应绑定同一修订：流式传输期间事务与行锁保持打开，此时发布新版本**不会混入**内容或元数据。
 - **可恢复复制会话**：`POST /copy-sessions` 在同一数据库快照中锁定源路径集合与全部目标路径，生成按稳定路径与修订序排列、带 SHA-256 内容摘要的清单，并为每个目标路径（含目标尚不存在的状态）保存**修订身份基线**；客户端按游标逐段拉取内容（重复拉取字节、摘要、游标完全一致，即使源对象随后发布新修订），逐段确认时服务锁定目标并与基线比较修订身份——**建档后目标路径的任何发布（哪怕字节与待复制内容完全相同）都判为冲突**，返回 `409`、冲突对象与恢复位置，整批不应用、不推进游标；基线未变时维持原子应用与会话前同内容目标的幂等跳过，重复确认或重放返回同一批次结果。
-- **历史修订回收**：`POST /gc` 提交 1～100 个对象路径（服务去重）、UTC 截止时间 `before` 与布尔 `dry_run`；只考虑创建时间**严格早于** `before` 的修订，且**当前修订、复制会话清单或目标基线引用的修订一律保留**。`dry_run`（缺省 `true`）在可重复读快照中按路径排序返回候选修订号、可释放字节数与被保留修订的原因，不改数据；`dry_run=false` 按固定路径升序锁定全部对象行，在**同一事务内重新判定并删除**，整批成功或回滚——与 PUT、复制会话建档/确认、流式 GET 并发时不会误删在用修订或留下悬空引用；重复执行返回空清单，后续发布的修订号仍递增。**已迁走的路径**（`POST /moves`）没有当前修订但仍保留修订历史，同样可以被回收：未被任何会话引用的旧修订正常清理，而会话清单/基线钉住的修订一律保留。
+- **历史修订回收**：`POST /gc` 提交 1～100 个对象路径（服务去重）、UTC 截止时间 `before` 与布尔 `dry_run`；只考虑创建时间**严格早于** `before` 的修订，且**当前修订、复制会话清单或目标基线引用的修订、有效历史修订租约引用的修订一律保留**。`dry_run`（缺省 `true`）在可重复读快照中按路径排序返回候选修订号、可释放字节数与被保留修订的原因（含 `revision_lease`），不改数据；`dry_run=false` 按固定路径升序锁定全部对象行，在**同一事务内重新判定并删除**，整批成功或回滚——与 PUT、复制会话建档/确认、租约创建、流式 GET 并发时不会误删在用修订或留下悬空引用；重复执行返回空清单，后续发布的修订号仍递增。**已迁走的路径**（`POST /moves`）没有当前修订但仍保留修订历史，同样可以被回收：未被任何会话或租约引用的旧修订正常清理，而会话清单/基线/有效租约钉住的修订一律保留。
+- **历史修订租约**：`POST /revision-leases` 提交 `path`、**正整数** `revision_no` 与 `ttl_seconds`（**60～86400 秒**），只能为**仍在库中**的修订（含当前修订、含已迁走路径下残留的历史修订）创建：服务先对对象行加 `FOR UPDATE` 行锁再查修订——与 `/gc` 执行共用同一全局锁序，因此**创建与回收按对象行严格串行**，要么租约先生效（`/gc` 的锁内重判定看到它、保留该修订），要么回收先提交（租约请求得到 404），绝不会"租约成功却丢了修订"。成功返回 **201**、随机租约 ID（32 位十六进制）、数据库时钟计算的 `created_at`/`expires_at` 以及绑定修订的强 ETag（响应头同时带 `ETag`/`Last-Modified`）；修订不存在返回 **404**（`revision_not_found`），参数非法返回 **400**。`GET/HEAD /revision-leases/{id}/content` 按**绑定的旧修订**执行与 `/objects` 完全相同的前置条件（304/412）与 Range/If-Range 规则（200/206/416）；绑定在创建时确定，**路径重新发布、迁移或重放请求都不改变响应**。读取先查租约再对对象行加 `FOR SHARE`、随后复查租约状态与修订是否存在，事务一直持有到最后一个字节——**读取开始后即使租约到期或被释放，流仍完整、元数据始终属于绑定修订**，`/gc` 会等待流结束才能删除。`DELETE /revision-leases/{id}` **幂等释放**：活动、已释放、已过期的租约都返回 204，从未存在的 ID 返回 **404**；释放/过期后再读内容返回 **410**（`lease_released` / `lease_expired`，含路径、修订号与时间戳），修订本身随后才可能被下一次 `/gc` 回收。
 - **对象路径迁移**：`POST /moves` 提交非空且互不相同的 `source_path`、`target_path`、`source_etag`（强 ETag）与正整数 `source_revision_no`；仅当**源强 ETag 与修订号都匹配当前修订、且目标当前无内容**时，按路径升序同时锁住两端，在**一个事务**内把源内容与媒体类型发布为目标的**新修订**（目标侧按自身历史 `max+1` 编号），并把源路径摘除（其 GET/HEAD 随即 **404**）。源不存在（含已迁走）返回 **404**，源已变（ETag 或修订号不符）返回 **412**（响应带当前 ETag/修订号），目标已有内容返回 **409**；任何失败整事务回滚，不留部分生效。已迁走的路径再次 PUT 或作为迁移目标复用时，修订号由每路径高水位线 `revision_seq` 锚定，**只增不复用、不回退**——即便旧修订已被 `/gc` 全部清理。
 
 ## 快速启动（Docker Compose）
@@ -42,7 +43,10 @@ curl http://localhost:8000/healthz
 | `GET` | `/copy-sessions/{id}` | 会话状态：清单摘要、分段进度、恢复位置 |
 | `GET` | `/copy-sessions/{id}/segments?cursor=` | 拉取游标之后的内容分段（无 `cursor` 参数时返回首段）；重复拉取字节、摘要、游标完全一致 |
 | `POST` | `/copy-sessions/{id}/acks` | 按游标确认分段：锁定目标并与建档修订基线比较身份，原子批次应用；建档后任何发布（含同字节重发）返回 `409`，整批不应用、不推进游标；重复确认 / 重放返回同一批次结果 |
-| `POST` | `/gc` | 历史修订回收：提交 `paths`（1～100，去重）、UTC 截止时间 `before` 与 `dry_run`；预览返回候选修订号、可释放字节数与保留原因，执行在同一事务内重判定并删除（整批成功或回滚）；路径不存在整次 `404` |
+| `POST` | `/gc` | 历史修订回收：提交 `paths`（1～100，去重）、UTC 截止时间 `before` 与 `dry_run`；预览与执行都返回候选/已删修订及保留原因（含 `revision_lease`），执行在同一事务内重判定并删除（整批成功或回滚）；路径不存在整次 `404` |
+| `POST` | `/revision-leases` | 为仍在库中的（路径, 正整数修订号）创建租约，TTL 60～86400 秒；201 返回随机租约 ID、到期时间与绑定修订 ETag；修订不存在 404，参数非法 400 |
+| `GET` / `HEAD` | `/revision-leases/{id}/content` | 按绑定的旧修订执行条件请求与 Range 规则（200/206/304/412/416）；未知 ID 404，租约过期或已释放 410；读取开始后到期/释放不影响进行中的流 |
+| `DELETE` | `/revision-leases/{id}` | 幂等释放租约（活动/已释放/已过期均 204）；未知 ID 404 |
 | `GET` | `/healthz` | 健康检查 |
 
 支持的条件头：`If-Match`、`If-None-Match`、`If-Modified-Since`、`If-Unmodified-Since`（PUT/GET/HEAD 均按 §13.2.2 顺序求值）。
@@ -339,10 +343,10 @@ curl -s -X POST http://localhost:8000/copy-sessions -H 'Content-Type: applicatio
 
 - 请求体：`paths`（1～100 个对象路径，服务去重）、`before`（ISO 8601 时间戳，无时区按 UTC 解释）、`dry_run`（布尔，缺省 `true`）。
 - 只有创建时间**严格早于** `before` 的修订才会进入回收视野（出现在 `candidates` / `retained` 中）。
-- **一律保留**：对象的当前修订、任何复制会话清单（`copy_manifest`）引用的修订、任何目标基线（`target_baseline`）引用的修订——因此回收永远不会让进行中的复制会话或流式 GET 读到悬空引用。
+- **一律保留**：对象的当前修订、任何复制会话清单（`copy_manifest`）引用的修订、任何目标基线（`target_baseline`）引用的修订，以及**有效历史修订租约**（`revision_lease`：未释放且 `expires_at > now()`）引用的修订——因此回收永远不会让进行中的复制会话、租约读取或流式 GET 读到悬空引用。
 - 任一路径不存在（含只有空占位行的路径）时**整次返回 404**，不回收任何对象。**已迁走的路径**（`revision_seq > 0`）始终算"存在"：历史还在时正常回收，历史被全部清完后重复执行返回空清单（200，与普通对象一致），而其修订号由 `revision_seq` 保留、不复用；只有从未有过内容的空占位行才报 404。
 - `dry_run=true`：在可重复读快照中按路径排序返回候选修订号、每路径与总的可释放字节数、被保留修订的原因，**不改动任何数据**。
-- `dry_run=false`：按固定路径升序以 `FOR UPDATE` 锁定全部对象行（与发布、建档、确认相同的全局锁序），在锁内**重新判定**候选并删除，同一事务提交——任何失败整批回滚，不留部分回收。并发 PUT / 建档 / 确认 / 流式 GET 要么已提交（被锁内重判定看到），要么等待本事务提交，因此在用修订不会被误删。
+- `dry_run=false`：按固定路径升序以 `FOR UPDATE` 锁定全部对象行（与发布、建档、确认、租约创建相同的全局锁序），在锁内**重新判定**候选并删除，同一事务提交——任何失败整批回滚，不留部分回收。响应除 `deleted` 外还带 `retained`：锁内重判定后存活的每个修订及其原因（与预览同一组 `current`/`copy_manifest`/`target_baseline`/`revision_lease` 原因），并发 PUT / 建档 / 确认 / 租约创建 / 流式 GET 要么已提交（被锁内重判定看到），要么等待本事务提交，因此在用修订不会被误删。
 - 重复执行返回空清单；当前修订（永远是最大修订号）不会被删除，后续发布继续 `max + 1` 递增，**不会复用已回收的修订号**。
 
 ```bash
@@ -384,13 +388,17 @@ curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
 #     {"path": "doc.txt", "revision_no": 2, "bytes": 5}
 #   ],
 #   "deleted_count": 2,
-#   "deleted_bytes": 12
+#   "deleted_bytes": 12,
+#   "retained": [
+#     {"path": "doc.txt", "revision_no": 3, "reasons": ["current"]}
+#   ]
 # }
 
 # 4. 重复执行返回空清单；当前修订不受影响；修订号继续递增
 curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
   -d '{"paths": ["doc.txt"], "before": "2099-01-01T00:00:00Z", "dry_run": false}'
-# {"dry_run":false,"before":"2099-01-01T00:00:00+00:00","deleted":[],"deleted_count":0,"deleted_bytes":0}
+# {"dry_run":false,"before":"2099-01-01T00:00:00+00:00","deleted":[],"deleted_count":0,
+#  "deleted_bytes":0,"retained":[{"path":"doc.txt","revision_no":3,"reasons":["current"]}]}
 curl -s http://localhost:8000/objects/doc.txt          # v3-c
 curl -si -X PUT --data-binary 'v4' http://localhost:8000/objects/doc.txt | grep -i x-revision-no
 # X-Revision-No: 4        <- 不复用已回收的 1/2
@@ -432,6 +440,122 @@ curl -si -X PUT --data-binary 'm3' http://localhost:8000/objects/mv.txt | grep -
 # X-Revision-No: 3        <- 历史已清空也不复用 1/2
 ```
 
+## 历史修订租约（POST /revision-leases）
+
+租约把一个**仍在库中的旧修订**（路径 + 修订号）临时钉住，使它在租约有效期内不被 `POST /gc` 回收，并提供一个稳定的读取端点。租约本身不影响 `GET /objects/{path}`（始终服务当前修订）；它服务的是"我需要这个历史修订继续存在一段时间"的场景（长期下载、审计、延迟归档）。
+
+- 请求体：`path`（非空字符串）、`revision_no`（正整数）、`ttl_seconds`（整数，**60～86400**）。
+- **只能为仍在库中的修订创建**：修订号不存在、路径不存在（含已被 `/gc` 清空历史的路径）都返回 **404** `revision_not_found`；参数非法返回 **400**。当前修订、以及已迁走路径（`POST /moves`）下尚未回收的历史修订同样在库、可租。
+- 成功返回 **201**：随机 `lease_id`（32 位十六进制，每次创建都不同）、绑定修订的 `etag`、以及以**数据库时钟**计算的 `created_at` / `expires_at`（恰相差 `ttl_seconds`）；响应头带该修订的 `ETag` 与 `Last-Modified`。
+- 创建事务**先锁对象行（FOR UPDATE）再查修订**，与 `/gc` 执行、PUT、迁移共用同一全局锁序：租约与回收严格串行，不存在"租约返回成功、修订却被删掉"的交错。
+- 有效租约是 `/gc` 的第四种保留原因 `revision_lease`，预览与执行都会报告；过期（`expires_at` 已过）或显式释放后即不再保留。
+- `GET/HEAD /revision-leases/{id}/content` 对**创建时绑定的旧修订**执行与 `/objects` 完全相同的规则：`If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since`（304/412）、`Range`/`If-Range`（206/416）。重新发布该路径、迁移该路径、重放同一请求都**不改变**状态码、头部与正文。
+- 读取在对象行 `FOR SHARE` 锁内复查租约与修订，事务保持到最后一个字节：**读取开始后租约到期或被释放，正在传输的正文与 ETag/Content-Range 等元数据仍完整一致**；并发的 `/gc` 会等待本次读取提交后才能删除该修订。
+- `DELETE /revision-leases/{id}` **幂等**：活动租约本次释放（204），重复释放、释放已过期租约仍是 204；只有从未存在的 ID 返回 **404**。释放/过期后读取内容返回 **410**（`lease_released` / `lease_expired`，响应体带 `path`、`revision_no`、`expires_at`、`released_at`）。注意 410 针对的是**租约状态**：修订可能仍在库中（路径上还有别的租约或它是当前修订），只是这张租约不再允许读取。
+
+```bash
+# 1. 准备两个修订（rev 1 是历史修订，rev 2 是当前修订）
+curl -s -X PUT --data-binary 'v1-aaaa' -H 'Content-Type: text/plain' \
+  http://localhost:8000/objects/lease-demo.txt
+curl -s -X PUT --data-binary 'v2-current' -H 'Content-Type: text/plain' \
+  http://localhost:8000/objects/lease-demo.txt
+
+# 2. 为旧修订 rev 1 创建 1 小时租约
+curl -i -X POST http://localhost:8000/revision-leases \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "lease-demo.txt", "revision_no": 1, "ttl_seconds": 3600}'
+# HTTP/1.1 201 Created
+# etag: "05d099dde10ec92e9d6fbe8345ba9b96f7b62c8ad942aba605b18c5a49151403"
+# last-modified: Fri, 02 Oct 2026 13:48:59 GMT
+#
+# {"lease_id":"13c15a3fe537aea723754b8b6bf07cef",
+#  "path":"lease-demo.txt","revision_no":1,
+#  "etag":"\"05d099dde10ec92e9d6fbe8345ba9b96f7b62c8ad942aba605b18c5a49151403\"",
+#  "ttl_seconds":3600,
+#  "created_at":"2026-10-02T13:48:59.881214+00:00",
+#  "expires_at":"2026-10-02T14:48:59.881214+00:00"}
+# （lease_id 与时间戳每次都不同；ETag 只取决于内容，"v1-aaaa" 的上面这串是确定值。）
+
+LID=13c15a3fe537aea723754b8b6bf07cef
+
+# 3. 参数非法 -> 400
+curl -i -X POST http://localhost:8000/revision-leases -H 'Content-Type: application/json' \
+  -d '{"path":"lease-demo.txt","revision_no":1,"ttl_seconds":10}'
+# HTTP/1.1 400 Bad Request
+# {"detail":"ttl_seconds must be an integer in [60, 86400]"}
+# revision_no 为 0/-1/1.5/"1"/true、字段缺失或非 JSON 同样是 400；TTL 边界 60 与 86400 合法。
+
+# 修订不在库中 -> 404（路径从未发布，或该修订号已被 /gc 回收）
+curl -i -X POST http://localhost:8000/revision-leases -H 'Content-Type: application/json' \
+  -d '{"path":"nope.txt","revision_no":1,"ttl_seconds":60}'
+# HTTP/1.1 404 Not Found
+# {"detail":"revision_not_found","path":"nope.txt","revision_no":1}
+
+# 4. 读取绑定的旧修订：返回的是 rev 1 而不是当前的 rev 2
+curl -i http://localhost:8000/revision-leases/$LID/content
+# HTTP/1.1 200 OK
+# etag: "05d099dde10ec92e9d6fbe8345ba9b96f7b62c8ad942aba605b18c5a49151403"
+# accept-ranges: bytes
+# content-type: text/plain
+# content-length: 7
+#
+# v1-aaaa
+
+# 条件请求与 Range 规则与 /objects 完全一致（针对绑定的旧修订求值）
+curl -i -H 'Range: bytes=0-3' http://localhost:8000/revision-leases/$LID/content
+# HTTP/1.1 206 Partial Content
+# content-range: bytes 0-3/7
+# content-length: 4
+# v1-a
+curl -i -H 'If-None-Match: "05d099dde10ec92e9d6fbe8345ba9b96f7b62c8ad942aba605b18c5a49151403"' \
+  http://localhost:8000/revision-leases/$LID/content          # 304
+curl -i -H 'If-Match: "stale"' http://localhost:8000/revision-leases/$LID/content  # 412
+curl -i -H 'Range: bytes=99-' http://localhost:8000/revision-leases/$LID/content
+# HTTP/1.1 416 Requested Range Not Satisfiable
+# content-range: bytes */7
+
+# 5. /gc 预览与执行都报告 revision_lease 保留原因，且不删除钉住的修订
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths":["lease-demo.txt"],"before":"2099-01-01T00:00:00Z","dry_run":true}' \
+  | python3 -m json.tool
+# "retained": [
+#   {"revision_no": 1, "reasons": ["revision_lease"]},
+#   {"revision_no": 2, "reasons": ["current"]}
+# ]
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths":["lease-demo.txt"],"before":"2099-01-01T00:00:00Z","dry_run":false}'
+# {"dry_run":false,...,"deleted":[],"deleted_count":0,"deleted_bytes":0,
+#  "retained":[
+#    {"path":"lease-demo.txt","revision_no":1,"reasons":["revision_lease"]},
+#    {"path":"lease-demo.txt","revision_no":2,"reasons":["current"]}]}
+
+# 6. 路径重新发布或迁移不改变租约响应（/objects 服务新内容，租约端点服务绑定修订）
+curl -s -X PUT --data-binary 'v3-totally-different' \
+  http://localhost:8000/objects/lease-demo.txt >/dev/null
+curl -s http://localhost:8000/objects/lease-demo.txt              # v3-totally-different
+curl -s http://localhost:8000/revision-leases/$LID/content        # v1-aaaa（不变）
+
+# 7. 幂等释放：204、再删一次仍 204；释放后读取为 410
+curl -i -X DELETE http://localhost:8000/revision-leases/$LID      # HTTP/1.1 204 No Content
+curl -i -X DELETE http://localhost:8000/revision-leases/$LID      # 204（幂等）
+curl -i http://localhost:8000/revision-leases/$LID/content
+# HTTP/1.1 410 Gone
+# {"detail":"lease_released","lease_id":"13c15a3fe537aea723754b8b6bf07cef",
+#  "path":"lease-demo.txt","revision_no":1,
+#  "expires_at":"2026-10-02T14:48:59.881214+00:00",
+#  "released_at":"2026-10-02T13:49:00.011964+00:00"}
+# 租约到期（超过 expires_at）后读取则是 410 + "detail":"lease_expired"、released_at 为 null。
+
+# 8. 释放后 /gc 才能回收该修订；未知租约 ID 的读取与删除都是 404
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths":["lease-demo.txt"],"before":"2099-01-01T00:00:00Z","dry_run":false}'
+# ...,"deleted":[{"path":"lease-demo.txt","revision_no":1,"bytes":7}],...
+curl -i http://localhost:8000/revision-leases/00000000000000000000000000000000/content
+# HTTP/1.1 404 Not Found    {"detail":"lease_not_found", ...}
+```
+
+进行中的大文件读取与释放/回收并发时也是安全的：服务在首字节前对对象行加 `FOR SHARE` 并保持事务到末字节之后，因此读流期间执行 `DELETE` 租约 + `POST /gc`，`/gc` 会等待读取结束；正文一次完整传完后，下一次读取才得到 410、修订才被回收。
+
 ## 本地开发
 
 ```bash
@@ -451,7 +575,8 @@ python -m pytest
 - `tests/test_copy_cursor.py`：复制游标与清单摘要的纯逻辑单元测试（编解码往返、防篡改、确定性）。
 - `tests/test_integration.py`：真实 PostgreSQL + 完整 HTTP 服务的端到端测试，覆盖 200/204/206/304/404/412/416、多段 multipart 确定性、`If-Range`、并发"仅创建"只有一个成功、以及流式传输期间发布新版本不混入内容。
 - `tests/test_copy_sessions.py`：复制会话端到端测试，覆盖清单顺序与摘要、分段重复拉取字节一致、源对象发布新修订后仍返回快照内容、原子应用、冲突整批回滚与结构化结果、**建档后同字节重新发布仍判冲突（含已存在目标的同内容新修订、整批回滚、新会话恢复）**、升级前无基线会话返回 `baseline_missing` 不按摘要放行、重放返回同一批次结果、乱序/伪造游标拒绝、跨会话断点续传与冲突恢复、并发确认收敛，以及**确认与目标首次发布在空占位行上的交错：DB 层确定性复现两种先后顺序（PUT 先 -> 409 非 500、修订号不重复；确认先 -> PUT 等待并接续修订号）+ HTTP 屏障压测两者皆不出现 500/重复修订号**。
-- `tests/test_gc.py`：历史修订回收端到端测试，覆盖请求校验（路径数 1～100、`before`、`dry_run`）、路径不存在整次 404 且执行路径不删任何修订（整批回滚）、空占位行视为不存在、预览分类与零副作用、截止时间的严格小于语义、路径去重与排序、执行后重放返回空清单、修订号不复用继续递增、清单/基线引用保留与原因合并、混合对象只回收未钉住修订且确认仍可应用，以及并发安全：**流式 GET 期间回收等待且不误删在读修订**、回收与 PUT 交错不删新修订且编号连续、回收与确认交错清单钉住的修订必存活、两个并发执行在锁内重判定收敛（每个修订只删一次）。
+- `tests/test_gc.py`：历史修订回收端到端测试，覆盖请求校验（路径数 1～100、`before`、`dry_run`）、路径不存在整次 404 且执行路径不删任何修订（整批回滚）、空占位行视为不存在、预览分类与零副作用、截止时间的严格小于语义、路径去重与排序、执行后重放返回空清单、修订号不复用继续递增、清单/基线/租约引用保留与原因合并、混合对象只回收未钉住修订且确认仍可应用，以及并发安全：**流式 GET 期间回收等待且不误删在读修订**、回收与 PUT 交错不删新修订且编号连续、回收与确认交错清单钉住的修订必存活、两个并发执行在锁内重判定收敛（每个修订只删一次）。
+- `tests/test_revision_leases.py`：历史修订租约端到端测试，覆盖创建参数校验（路径非空、正整数修订号、TTL 60～86400 且拒绝 bool/float/字符串、边界值 60/86400）、201 响应（随机 32 位十六进制 ID 每次不同、ETag 为绑定修订强 ETag、`expires_at - created_at` 恰为 TTL）、修订不存在/已回收均 404、GET/HEAD 服务**绑定的旧修订**（内容、媒体类型、Content-Length 与 ETag 一致）、条件请求（304/412 针对旧修订而非当前修订）、Range/If-Range/多段 multipart 及 416、重发/重新发布/路径迁移后响应不变、已迁走路径残留历史可租、`/gc` 预览与执行均报告 `revision_lease` 原因且不删除被钉修订（原因与 `current` 合并）、释放与到期后不再保留且读取为 410（区分 `lease_released`/`lease_expired` 与载荷字段）、DELETE 幂等（活动/重复/过期均 204）与未知 ID 404、**2 MiB 流读取期间释放或到期 + /gc 交错时流完整且元数据一致、/gc 等待流结束后才删除**，以及**租约创建与 /gc 在对象行锁上串行：8 轮屏障压测只出现"租约先生效→修订保留且可读"或"回收先提交→租约 404"两种合法结局**。
 - `tests/test_moves.py`：对象路径迁移端到端测试，覆盖请求体校验（字段必填、路径非空且不同、强 ETag、正整数修订号）、成功迁移后目标以自身修订号提供相同内容/媒体类型而源 GET/HEAD 为 404、目标编号接续目标自身历史、404（源缺失/已迁走）/412（ETag、修订号或两者不符并回带当前校验值）/409（目标已有内容）均无部分生效、失败回滚后目标仍可 `If-None-Match: *` 首建、**已迁走路径再次 PUT 或作为目标复用时修订号只增不复用、且在 /gc 清空历史后仍由 `revision_seq` 保持单调**、迁移前会话仍可拉取固定源修订且变化的目标基线按原规则 409、/gc 只清理未被会话引用的旧修订而不误删钉住修订，以及并发：同源发散迁移恰一个成功（另一个 404）、争同一目标恰一个成功（另一个 409）、重叠锁集的交叉迁移不死锁且结果为合法串行历史、迁移与目标首发布交错（PUT 先则 409、迁移先则 PUT 接续修订 2，无 500/无重复编号）、流式 GET 期间迁移等待且不撕裂响应。
 
 ## 设计要点
@@ -468,3 +593,4 @@ python -m pytest
 - **升级兼容**：表结构由启动时的 `CREATE TABLE IF NOT EXISTS` 自动补齐，旧库重启即有基线表；升级前创建的未完成会话没有基线行，确认未完成段时返回 `409 baseline_missing` 且不推进游标（绝不按摘要放行），重新创建会话取得新基线后继续；已经持久化的历史确认结果仍优先重放，不受影响。
 - **历史修订回收**：`POST /gc` 的执行路径在单事务内先用一条按路径升序的纯 `FOR UPDATE`（不连接 `revisions`、不补占位行）锁定全部请求对象行——与发布、建档（`FOR SHARE`）、确认共用同一全局锁序，彼此串行化而不死锁——再在锁内重新分类：只考虑 `created_at` 严格早于 `before` 的修订，且当前修订、被任何清单或基线引用的修订一律保留，其余同事务删除，任何失败整批回滚。因为重判定发生在锁内，并发 PUT、建档、确认或流式 GET 要么已提交（其结果对分类可见）、要么阻塞到回收提交，所以在用修订不会被误删、外键（`objects.current_id`、清单、基线）不会悬空。当前修订永远是最大修订号且必被保留，`max(revision_no) + 1` 的编号在回收后仍严格递增、不复用旧号。预览（`dry_run`）则在 `REPEATABLE READ` 只读快照中完成存在性检查与分类，不阻塞任何写者。**路径迁移后**，源路径的对象行仍在但 `current_id` 为 NULL：存在性判定把"`current_id` 非空 **或** `revision_seq > 0`"视为存在，所以迁走的路径（包括历史已被全部回收的）始终是合法回收对象、重复执行返回空清单；只有从未有过内容的空占位行（`revision_seq = 0`）才报 404。
 - **对象路径迁移**：`POST /moves` 在单事务内先为两端（按需）插入占位行，再用一条按路径升序的纯 `FOR UPDATE` 同时锁住源与目标的 `objects` 行——与 PUT、建档、确认、回收完全相同的全局锁序，交叉/交换端点的迁移也按同一顺序取锁，串行化而不死锁——锁到手后才 LEFT JOIN `revisions` 读取两端当前修订并按 **404（源无当前修订）→ 412（源强 ETag 或修订号不符）→ 409（目标已有内容）** 顺序判定；全部满足时，把源当前修订的**字节与媒体类型**经 `publish_revision` 作为目标的**全新修订**插入（新的修订 `id`，修订号按目标自身历史 `max+1`），再把源行 `current_id` 置 NULL 摘除——插入新修订与摘除源在同一事务提交，任何失败整批回滚，外部永远看不到部分迁移。迁移不复制修订行本身：它在目标路径新建修订，因此源路径的旧修订行保持原样、仍被迁移前的复制会话清单/基线钉住，`/gc` 据此正常保留。每路径的 `objects.revision_seq` 高水位线在每次发布时随 `revision_no` 一起推进；摘除源行不清零。发布编号取 `GREATEST(revision_seq, max(revision_no)) + 1`，于是已迁走路径（行在但 `current_id` 为 NULL，且其旧修订可被 `/gc` 全部删除）再次 PUT 或作为迁移目标复用时，编号只从旧高水位 +1 继续——绝不回退、绝不复用。
+- **历史修订租约**：`revision_leases(id, object_path, revision_id, revision_no, created_at, expires_at, released_at)` 是 `/gc` 的第四种保留事实，分类 SQL 在锁内多算一个 `EXISTS (... released_at IS NULL AND expires_at > now())`，预览原因记为 `revision_lease`（可与 `current`/`copy_manifest`/`target_baseline` 叠加）。该表**故意不加指向 `revisions` 的外键**：租约过期或释放后修订可以被回收，而租约行必须保留，读取才能回答 410（曾经存在但已失效）而非 404（从未存在）；"租约是否有效"是动态时间谓词，无法由外键表达，一致性改由**对象行锁 + 读取事务持锁到流末**保证（见下）。创建租约在单事务内先用一条**不连接 `revisions` 的纯 `FOR UPDATE`** 锁住对象行（不补占位行——租约不创建对象），锁到手后才按 `(object_path, revision_no)` 查修订：与 `/gc` 执行的"先锁行后分类"在同一全局路径锁序上严格串行——租约先提交则其 INSERT 在 GC 事务快照内可见、修订被保留；GC 先提交则修订已删除、查得 NULL 返回 404，因此"租约成功却丢失修订"在调度上不可达。租约 ID 用 `secrets.token_hex(16)` 随机生成，过期时间由 PostgreSQL `now() + make_interval(secs => ttl)` 计算，与 GC 判定共用同一数据库时钟。内容读取分三步：①无锁读租约行（未知 ID → 404）；②对其 `object_path` 加 `FOR SHARE`；③**锁内复查**租约是否仍未释放且未过期、绑定修订是否仍存在（释放→410 `lease_released`，过期/已回收→410 `lease_expired`），随后复用 `/objects` 的同一套前置条件求值与 Range 计划，并由共享的流式助手在末字节发送后才提交事务。因此一旦读取开始，租约到期、`DELETE` 释放、路径迁移或重新发布都无法改变该响应：GC 的 `FOR UPDATE`/DELETE 会等待 `FOR SHARE` 释放，流完才可能删除；而 HEAD/304/412/416 在同一事务内立即提交。`DELETE` 用 `UPDATE ... WHERE released_at IS NULL AND expires_at > now()` 做条件更新，活动→本次释放、已释放/已过期→幂等 204，仅查无此行才 404。

@@ -13,6 +13,9 @@ COPY_SEGMENT_SIZE = int(os.environ.get("ORIGIN_COPY_SEGMENT_SIZE", "16"))
 COPY_MAX_SEGMENT_SIZE = int(os.environ.get("ORIGIN_COPY_MAX_SEGMENT_SIZE", "1024"))
 # Upper bound for object paths accepted by one revision-GC request.
 GC_MAX_PATHS = int(os.environ.get("ORIGIN_GC_MAX_PATHS", "100"))
+# Allowed lifetime window of a historical-revision lease (seconds).
+LEASE_MIN_TTL = int(os.environ.get("ORIGIN_LEASE_MIN_TTL", "60"))
+LEASE_MAX_TTL = int(os.environ.get("ORIGIN_LEASE_MAX_TTL", "86400"))
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS objects (
@@ -148,4 +151,33 @@ UPDATE objects o
  WHERE revision_seq < COALESCE((SELECT max(r.revision_no)
                                  FROM revisions r
                                 WHERE r.object_path = o.path), 0);
+
+-- Historical revision leases.  A lease pins one still-stored revision
+-- (path + revision number) until ``expires_at`` or explicit release;
+-- while active it is a fourth GC retention reason, on equal footing with
+-- the current revision, copy manifests and target baselines.
+--
+-- Deliberately NO foreign key to ``revisions``: the lease must keep its
+-- identity (status, expiry, bound path/revision) AFTER the revision is
+-- collected once the lease is itself expired or released, so GET/DELETE
+-- can answer 410/204 instead of 404 for a previously known lease id.
+-- GC instead re-checks liveness under the object row FOR UPDATE lock, and
+-- a read that has pinned its revision keeps the transaction (and its
+-- share lock) open until the whole body has been streamed, so the bytes
+-- never disappear mid-response.
+CREATE TABLE IF NOT EXISTS revision_leases (
+    id            text PRIMARY KEY,
+    object_path   text NOT NULL,
+    revision_id   bigint NOT NULL,
+    revision_no   bigint NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at    timestamptz NOT NULL,
+    released_at   timestamptz
+);
+
+-- Lookup "is this revision pinned by an active lease?" runs on every GC
+-- classification, exactly like the copy-session reference checks.
+CREATE INDEX IF NOT EXISTS revision_leases_revision_active_idx
+    ON revision_leases (revision_id)
+    WHERE released_at IS NULL;
 """
